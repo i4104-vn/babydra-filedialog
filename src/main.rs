@@ -195,13 +195,13 @@ fn main() {
     }
 
     let default_title = match mode {
-        FileDialogMode::OpenFolder => "Open Folder",
-        FileDialogMode::OpenFile => "Open File",
-        FileDialogMode::OpenMultipleFiles => "Open Files",
-        FileDialogMode::SaveFile => "Save File",
+        FileDialogMode::OpenFolder => babydra_core::i18n::trans("file_dialog.title_open_folder"),
+        FileDialogMode::OpenFile => babydra_core::i18n::trans("file_dialog.title_open_file"),
+        FileDialogMode::OpenMultipleFiles => babydra_core::i18n::trans("file_dialog.title_open_files"),
+        FileDialogMode::SaveFile => babydra_core::i18n::trans("file_dialog.title_save_file"),
     };
 
-    let title = custom_title.unwrap_or_else(|| default_title.to_string());
+    let title = custom_title.unwrap_or(default_title);
 
     let opts = FileDialogOptions {
         title,
