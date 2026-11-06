@@ -38,41 +38,301 @@ fn print_help() {
     println!("    When invoked as 'xdg-open' or with '--open', opens targets in default apps.");
 }
 
+fn flush_glib_context() {
+    let ctx = glib::MainContext::default();
+    for _ in 0..15 {
+        if !ctx.iteration(false) {
+            break;
+        }
+    }
+}
+
 fn handle_xdg_open(target: &str) -> i32 {
     let _ = gtk4::init();
 
-    let uri = if target.starts_with("http://")
+    // 1. Web and URI schemes (http, https, mailto, etc.)
+    if target.starts_with("http://")
         || target.starts_with("https://")
-        || target.starts_with("file://")
         || target.starts_with("mailto:")
+        || target.starts_with("ftp://")
     {
-        target.to_string()
-    } else {
-        let path = Path::new(target);
-        if path.is_dir() {
-            babydra_core::services::explore::show_in_file_manager(path);
+        if gio::AppInfo::launch_default_for_uri(target, None::<&gio::AppLaunchContext>).is_ok() {
+            flush_glib_context();
             return 0;
         }
-        let abs = if path.is_relative() {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
-        } else {
-            path.to_path_buf()
-        };
-        let canonical = std::fs::canonicalize(&abs).unwrap_or(abs);
-        match url::Url::from_file_path(&canonical) {
-            Ok(u) => u.to_string(),
-            Err(_) => format!("file://{}", canonical.to_string_lossy()),
+        for browser in &["opera", "google-chrome-stable", "google-chrome", "firefox", "chromium"] {
+            if std::process::Command::new(browser).arg(target).spawn().is_ok() {
+                return 0;
+            }
         }
+        eprintln!("Failed to open URI: {target}");
+        return 1;
+    }
+
+    // 2. Resolve target to PathBuf
+    let path = if let Ok(parsed_url) = url::Url::parse(target) {
+        if parsed_url.scheme() == "file" {
+            parsed_url.to_file_path().unwrap_or_else(|_| PathBuf::from(target))
+        } else {
+            PathBuf::from(target)
+        }
+    } else {
+        PathBuf::from(target)
     };
 
-    if gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>).is_ok() {
-        0
+    let abs_path = if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or_else(|_| path.clone())
     } else {
-        eprintln!("Failed to open URI: {uri}");
-        1
+        path.clone()
+    };
+
+    let canonical = std::fs::canonicalize(&abs_path).unwrap_or(abs_path);
+
+    // 3. Directory -> Open in file manager (BabyDra Explore)
+    if canonical.is_dir() {
+        babydra_core::services::explore::show_in_file_manager(&canonical);
+        return 0;
     }
+
+    // 4. File URI
+    let file_uri = match url::Url::from_file_path(&canonical) {
+        Ok(u) => u.to_string(),
+        Err(_) => format!("file://{}", canonical.to_string_lossy()),
+    };
+
+    // Try standard GIO launch first
+    if gio::AppInfo::launch_default_for_uri(&file_uri, None::<&gio::AppLaunchContext>).is_ok() {
+        flush_glib_context();
+        return 0;
+    }
+
+    // Fallback: Determine MIME type and default application
+    if fallback_open_file(&canonical, &file_uri) {
+        return 0;
+    }
+
+    eprintln!("Failed to open: {}", canonical.display());
+    1
+}
+
+fn fallback_open_file(path: &Path, file_uri: &str) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    // Check known BabyDra app associations by extension
+    let is_text_or_code = matches!(
+        ext.as_str(),
+        "txt"
+            | "md"
+            | "markdown"
+            | "rs"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cxx"
+            | "py"
+            | "js"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "json"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "css"
+            | "scss"
+            | "html"
+            | "xml"
+            | "csv"
+            | "ini"
+            | "conf"
+            | "log"
+            | "diff"
+            | "patch"
+            | "desktop"
+            | "service"
+            | "sql"
+            | "lua"
+            | "go"
+            | "java"
+    );
+
+    if is_text_or_code {
+        if std::process::Command::new("babydra-notepad")
+            .arg(path)
+            .spawn()
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    let is_media = matches!(
+        ext.as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
+            | "bmp"
+            | "svg"
+            | "ico"
+            | "mp4"
+            | "mkv"
+            | "webm"
+            | "avi"
+            | "mov"
+            | "flv"
+    );
+
+    if is_media {
+        if std::process::Command::new("babydra-preview")
+            .arg(path)
+            .spawn()
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    // Query xdg-mime default
+    if let Ok(mime_out) = std::process::Command::new("xdg-mime")
+        .args(["query", "filetype", path.to_str().unwrap_or("")])
+        .output()
+    {
+        let mime = String::from_utf8_lossy(&mime_out.stdout).trim().to_string();
+        if !mime.is_empty() {
+            if let Ok(def_out) = std::process::Command::new("xdg-mime")
+                .args(["query", "default", &mime])
+                .output()
+            {
+                let desktop_id = String::from_utf8_lossy(&def_out.stdout).trim().to_string();
+                if !desktop_id.is_empty() {
+                    if desktop_id.contains("notepad") {
+                        if std::process::Command::new("babydra-notepad")
+                            .arg(path)
+                            .spawn()
+                            .is_ok()
+                        {
+                            return true;
+                        }
+                    } else if desktop_id.contains("preview") {
+                        if std::process::Command::new("babydra-preview")
+                            .arg(path)
+                            .spawn()
+                            .is_ok()
+                        {
+                            return true;
+                        }
+                    } else if desktop_id.contains("explore") {
+                        if std::process::Command::new("babydra-explore")
+                            .arg(path)
+                            .spawn()
+                            .is_ok()
+                        {
+                            return true;
+                        }
+                    }
+
+                    // Try to launch from desktop file
+                    if launch_desktop_entry(&desktop_id, path, file_uri) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Final fallback: If small text-like file, try notepad
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() < 10 * 1024 * 1024 {
+            if std::process::Command::new("babydra-notepad")
+                .arg(path)
+                .spawn()
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn launch_desktop_entry(desktop_id: &str, path: &Path, file_uri: &str) -> bool {
+    let search_dirs = [
+        dirs::data_dir().map(|d| d.join("applications")),
+        Some(PathBuf::from("/usr/local/share/applications")),
+        Some(PathBuf::from("/usr/share/applications")),
+    ];
+
+    for dir in search_dirs.into_iter().flatten() {
+        let desktop_path = dir.join(desktop_id);
+        if desktop_path.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&desktop_path) {
+                let mut exec_line = None;
+                let mut is_terminal = false;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("Exec=") {
+                        exec_line = Some(trimmed["Exec=".len()..].trim().to_string());
+                    } else if trimmed.starts_with("Terminal=") {
+                        is_terminal = trimmed.ends_with("true");
+                    }
+                }
+
+                if let Some(exec) = exec_line {
+                    let mut parts: Vec<String> =
+                        exec.split_whitespace().map(|s| s.to_string()).collect();
+                    if parts.is_empty() {
+                        continue;
+                    }
+
+                    let binary = parts.remove(0);
+                    let mut args = Vec::new();
+                    let mut substituted = false;
+                    for p in parts {
+                        if p == "%f" || p == "%F" {
+                            args.push(path.to_string_lossy().to_string());
+                            substituted = true;
+                        } else if p == "%u" || p == "%U" {
+                            args.push(file_uri.to_string());
+                            substituted = true;
+                        } else if !p.starts_with('%') {
+                            args.push(p);
+                        }
+                    }
+                    if !substituted {
+                        args.push(path.to_string_lossy().to_string());
+                    }
+
+                    if is_terminal {
+                        let mut term_cmd = std::process::Command::new("kitty");
+                        term_cmd.arg("-e").arg(&binary).args(&args);
+                        if term_cmd.spawn().is_ok() {
+                            return true;
+                        }
+                    } else {
+                        let mut cmd = std::process::Command::new(&binary);
+                        cmd.args(&args);
+                        if cmd.spawn().is_ok() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn main() {
